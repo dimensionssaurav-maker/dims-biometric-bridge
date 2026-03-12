@@ -115,50 +115,49 @@ async function fetchLastPunchData() {
 async function saveInOutToFirebase(records) {
   let saved = 0;
   for (const r of records) {
-    // Field names from API doc: Empcode, INTime, OUTTime, WorkTime, Status, DateString, Name
     const empCode  = String(r.Empcode  || r.empcode  || r.EmpCode  || '').trim();
     const empName  = String(r.Name     || r.name     || r.EmpName  || '').trim();
-    const dateStr  = String(r.DateString || r.Date   || '').trim(); // dd/MM/yyyy
+    const dateStr  = String(r.DateString || r.Date   || '').trim();
     const inTime   = String(r.INTime   || r.InTime   || '').trim();
     const outTime  = String(r.OUTTime  || r.OutTime  || '').trim();
     const status   = String(r.Status   || '').trim();
     const workTime = String(r.WorkTime || '').trim();
+    const overTime = String(r.OverTime || '').trim();
     const remark   = String(r.Remark   || '').trim();
+    const lateIn   = String(r.Late_In  || '').trim();
 
     if (!empCode || !dateStr) continue;
 
-    // Convert dd/MM/yyyy → yyyy-MM-dd for Firebase
+    // Convert dd/MM/yyyy → yyyy-MM-dd
     let date = dateStr;
     if (/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) {
       const [d, m, y] = dateStr.split('/');
       date = `${y}-${m}-${d}`;
     }
 
+    // Use empCode_date as document ID — no query/index needed, pure upsert
+    const docId = `${empCode}_${date}`;
+
+    const docData = {
+      empCode, empName, date,
+      employeeId: empCode,           // so DIMS app can match by employeeId too
+      punchIn:    inTime  !== '--:--' ? inTime  : '',
+      punchOut:   outTime !== '--:--' ? outTime : '',
+      checkIn:    inTime  !== '--:--' ? inTime  : '',
+      checkOut:   outTime !== '--:--' ? outTime : '',
+      status:     status || 'Present',
+      workTime, overTime, remark, lateIn,
+      source:     'eTimeOffice-API',
+      liveSync:   true,
+      syncedAt:   admin.firestore.FieldValue.serverTimestamp(),
+    };
+
     try {
-      const snap = await db.collection('attendance')
-        .where('empCode', '==', empCode)
-        .where('date',    '==', date)
-        .get();
-
-      const docData = {
-        empCode, empName, date,
-        punchIn:   inTime  !== '--:--' ? inTime  : '',
-        punchOut:  outTime !== '--:--' ? outTime : '',
-        status:    status || 'Present',
-        workTime,  remark,
-        source:    'eTimeOffice-API',
-        liveSync:  true,
-        syncedAt:  admin.firestore.FieldValue.serverTimestamp(),
-      };
-
-      if (snap.empty) {
-        await db.collection('attendance').add(docData);
-      } else {
-        await snap.docs[0].ref.update(docData);
-      }
+      // set() with merge:true = upsert — no index needed, no query needed
+      await db.collection('attendance').doc(docId).set(docData, { merge: true });
       saved++;
     } catch (e) {
-      log(`Firebase error ${empCode}/${date}: ${e.message}`, 'error');
+      log(`Firebase error ${docId}: ${e.message}`, 'error');
     }
   }
   return saved;
@@ -345,47 +344,129 @@ app.get('/sync/date', async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  log(`🚀 Server on port ${PORT}`, 'info');
-  log(`Auth: Basic ${Buffer.from(`${CORP}:${USER}:${PASS}:true`).toString('base64')}`, 'info');
-  log(`API Doc says: Header Authorization = Basic base64(corporateid:username:password:true)`, 'info');
-  startScheduler();
-});
 
 // ════════════════════════════════════════════════════════════════════════════
-// IMPORT EMPLOYEES — extract unique employees from eTimeOffice attendance
-// and save them to Firebase employees collection
+// FETCH EMPLOYEE MASTER — tries all possible eTimeOffice employee endpoints
+// to get Department, Designation, DOJ, etc.
+// ════════════════════════════════════════════════════════════════════════════
+async function fetchEmployeeMaster() {
+  const headers = {
+    'Authorization': getAuthHeader(),
+    'Accept':        'application/json',
+    'Content-Type':  'application/json',
+  };
+
+  // All possible employee master endpoints
+  const endpoints = [
+    `${BASE_URL}/GetEmployeeMaster`,
+    `${BASE_URL}/GetAllEmployee`,
+    `${BASE_URL}/EmployeeMaster`,
+    `${BASE_URL}/GetEmployeeList`,
+    `${BASE_URL}/GetEmployee`,
+    `${BASE_URL}/EmployeeList`,
+    `${BASE_URL}/GetEmployeeDetails`,
+    `${BASE_URL}/GetEmployeeInfo`,
+    `${BASE_URL}/DownloadEmployeeMaster`,
+    `${BASE_URL}/GetMasterEmployee`,
+    `${BASE_URL}/Employee/GetAll`,
+    `${BASE_URL}/v1/GetEmployeeMaster`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      log(`Trying: GET ${url}`, 'info');
+      const res  = await fetch(url, { headers });
+      const text = await res.text();
+      log(`← ${res.status}: ${text.substring(0, 200)}`, 'info');
+
+      if (res.status === 404) continue;
+
+      let data;
+      try { data = JSON.parse(text); } catch { continue; }
+
+      // Look for array of employee records
+      const arr =
+        data.EmployeeList || data.employeeList ||
+        data.EmployeeMaster || data.employeeMaster ||
+        data.Data || data.data ||
+        data.Result || data.result ||
+        data.Employees || data.employees ||
+        (Array.isArray(data) ? data : null);
+
+      if (Array.isArray(arr) && arr.length > 0) {
+        log(`✅ Employee master found at ${url} — ${arr.length} records`, 'success');
+        return arr;
+      }
+    } catch (e) {
+      log(`✗ ${url}: ${e.message}`, 'warn');
+    }
+  }
+
+  log('No employee master endpoint found — will use attendance data only', 'warn');
+  return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// IMPORT EMPLOYEES — with Department, Designation, DOJ from master API
 // GET /import/employees
 // ════════════════════════════════════════════════════════════════════════════
 app.get('/import/employees', async (req, res) => {
   log('━━━ EMPLOYEE IMPORT START ━━━', 'info');
   try {
-    // Fetch last 30 days to get all active employees
+    // Step 1: Try to get full employee master (with dept, designation, DOJ)
+    const masterRecords = await fetchEmployeeMaster();
+
+    // Step 2: Also fetch attendance to get names+codes as fallback
     const now   = new Date(new Date().toLocaleString('en-US', {timeZone:'Asia/Kolkata'}));
     const toD   = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
     const past  = new Date(now); past.setDate(past.getDate() - 30);
     const fromD = `${String(past.getDate()).padStart(2,'0')}/${String(past.getMonth()+1).padStart(2,'0')}/${past.getFullYear()}`;
 
-    log(`Fetching attendance ${fromD} → ${toD} to extract employees`, 'info');
-    const records = await fetchInOutData(fromD, toD);
+    const attRecords = await fetchInOutData(fromD, toD);
 
-    // Extract unique employees from attendance records
+    // Step 3: Build employee map from attendance data
     const empMap = {};
-    for (const r of records) {
+    for (const r of attRecords) {
       const code = String(r.Empcode || r.empcode || r.EmpCode || '').trim();
       const name = String(r.Name    || r.name    || r.EmpName || '').trim();
-      if (!code || empMap[code]) continue;
-      empMap[code] = { code, name };
+      if (!code) continue;
+      if (!empMap[code]) empMap[code] = { code, name };
+    }
+
+    // Step 4: Enrich with master data if available
+    if (masterRecords && masterRecords.length > 0) {
+      log(`Enriching with master data — ${masterRecords.length} records`, 'info');
+      for (const m of masterRecords) {
+        const code = String(
+          m.EmpCode || m.empCode || m.Empcode || m.EmployeeCode ||
+          m.EmpId   || m.empId   || m.Id      || ''
+        ).trim();
+        if (!code) continue;
+
+        if (!empMap[code]) empMap[code] = { code, name: '' };
+
+        // Extract all possible fields from master
+        empMap[code].name        = empMap[code].name || m.Name || m.EmpName || m.EmployeeName || '';
+        empMap[code].department  = m.Department || m.Dept || m.DeptName || m.department || '';
+        empMap[code].designation = m.Designation || m.Desg || m.DesignationName || m.designation || '';
+        empMap[code].doj         = m.DOJ || m.DateOfJoining || m.JoiningDate || m.doj || m.joiningDate || '';
+        empMap[code].dob         = m.DOB || m.DateOfBirth   || m.dob || '';
+        empMap[code].gender      = m.Gender || m.gender || 'Male';
+        empMap[code].phone       = m.Mobile || m.Phone || m.ContactNo || m.phone || '';
+        empMap[code].email       = m.Email  || m.email || '';
+        empMap[code].cardNo      = m.CardNo || m.EmpcardNo || m.cardNo || '';
+      }
     }
 
     const uniqueEmps = Object.values(empMap);
-    log(`Found ${uniqueEmps.length} unique employees`, 'info');
+    log(`Total unique employees: ${uniqueEmps.length}`, 'info');
 
-    // Check existing employees in Firebase to avoid duplicates
+    // Step 5: Check existing in Firebase
     const existingSnap = await db.collection('employees').get();
     const existingCodes = new Set(existingSnap.docs.map(d => d.data().employeeCode || ''));
+
+    // Collect unique departments for the departments collection
+    const deptSet = new Set();
 
     let imported = 0, skipped = 0;
     const importedList = [];
@@ -393,50 +474,102 @@ app.get('/import/employees', async (req, res) => {
     for (const emp of uniqueEmps) {
       if (existingCodes.has(emp.code)) { skipped++; continue; }
 
+      if (emp.department) deptSet.add(emp.department);
+
+      // Normalize DOJ to yyyy-MM-dd
+      let joiningDate = '';
+      if (emp.doj) {
+        const d = emp.doj.toString().trim();
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(d)) {
+          const [dd, mm, yyyy] = d.split('/');
+          joiningDate = `${yyyy}-${mm}-${dd}`;
+        } else if (/^\d{4}-\d{2}-\d{2}/.test(d)) {
+          joiningDate = d.substring(0, 10);
+        } else {
+          joiningDate = d;
+        }
+      }
+
       const empData = {
         employeeCode:     emp.code,
         name:             emp.name || `Employee ${emp.code}`,
-        designation:      '',
-        department:       '',
+        designation:      emp.designation  || '',
+        department:       emp.department   || '',
         status:           'Active',
-        joiningDate:      '',
+        joiningDate,
         salary:           0,
-        phone:            '',
-        email:            '',
+        phone:            emp.phone  || '',
+        email:            emp.email  || '',
         address:          '',
         bankAccount:      '',
         ifsc:             '',
         bankName:         '',
         pan:              '',
         aadhar:           '',
-        gender:           'Male',
-        dob:              '',
+        gender:           emp.gender || 'Male',
+        dob:              emp.dob    || '',
         pfNumber:         '',
         esiNumber:        '',
         emergencyContact: '',
+        cardNo:           emp.cardNo || '',
         source:           'eTimeOffice-AutoImport',
         createdAt:        admin.firestore.FieldValue.serverTimestamp(),
       };
 
       const docRef = await db.collection('employees').add(empData);
-      importedList.push({ id: docRef.id, code: emp.code, name: emp.name });
+      importedList.push({
+        id:          docRef.id,
+        code:        emp.code,
+        name:        emp.name,
+        department:  emp.department  || '—',
+        designation: emp.designation || '—',
+        joiningDate: joiningDate     || '—',
+      });
       imported++;
     }
 
-    log(`━━━ EMPLOYEE IMPORT DONE — ${imported} imported, ${skipped} already existed ━━━`, 'success');
+    // Step 6: Save departments to Firebase departments collection
+    let deptsImported = 0;
+    if (deptSet.size > 0) {
+      try {
+        const deptSnap = await db.collection('departments').doc('main').get();
+        const existing = deptSnap.exists ? (deptSnap.data().list || []) : [];
+        const allDepts = [...new Set([...existing, ...Array.from(deptSet)])];
+        await db.collection('departments').doc('main').set({ list: allDepts });
+        deptsImported = deptSet.size;
+        log(`Saved ${deptsImported} departments to Firebase`, 'success');
+      } catch (e) {
+        log(`Dept save error: ${e.message}`, 'warn');
+      }
+    }
+
+    log(`━━━ IMPORT DONE — ${imported} employees, ${deptsImported} departments ━━━`, 'success');
 
     res.json({
-      success:  true,
+      success:          true,
       imported,
       skipped,
-      total:    uniqueEmps.length,
-      employees: importedList,
-      message:  `✅ ${imported} employees imported into Firebase! ${skipped} already existed.`,
-      nextStep: 'Refresh your DIMS HRMS app — all employees will appear in the Employees tab!',
+      total:            uniqueEmps.length,
+      departmentsFound: deptsImported,
+      hasMasterData:    !!masterRecords,
+      masterFields:     masterRecords ? 'Department, Designation, DOJ, DOB, Phone, Email' : 'Not available — only Name & Code from attendance',
+      employees:        importedList,
+      message:          `✅ ${imported} employees imported! ${deptsImported} departments saved.`,
+      nextStep:         'Refresh DIMS HRMS — Employees tab will show all staff!',
     });
 
   } catch (err) {
     log(`Employee import failed: ${err.message}`, 'error');
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message, logs: syncLog.slice(0, 20) });
   }
+});
+
+
+// ── Start ──────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  log(`🚀 Server on port ${PORT}`, 'info');
+  log(`Auth: Basic ${Buffer.from(`${CORP}:${USER}:${PASS}:true`).toString('base64')}`, 'info');
+  log(`API Doc says: Header Authorization = Basic base64(corporateid:username:password:true)`, 'info');
+  startScheduler();
 });
