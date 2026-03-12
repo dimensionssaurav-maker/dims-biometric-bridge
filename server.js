@@ -6,355 +6,323 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Firebase Init ─────────────────────────────────────────────────────────────
+// ── Firebase ──────────────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ── eTimeOffice Credentials ───────────────────────────────────────────────────
-// From login screen: CorporateID | User Name | Password
-const ETO_CORPORATE = process.env.ETIMEOFFICE_CORPORATEID || 'DIMENSIONS';
-const ETO_USERNAME  = process.env.ETIMEOFFICE_USERNAME    || 'DIMENSIONS';
-const ETO_PASSWORD  = process.env.ETIMEOFFICE_PASSWORD    || 'Dimensions@1';
-const ETO_BASE      = 'https://api.etimeoffice.com';
-const INTERVAL_MIN  = parseInt(process.env.FETCH_INTERVAL_MIN || '5');
+// ── Credentials ───────────────────────────────────────────────────────────────
+const CORP     = process.env.ETIMEOFFICE_CORPORATEID || 'DIMENSIONS';
+const USER     = process.env.ETIMEOFFICE_USERNAME    || 'DIMENSIONS';
+const PASS     = process.env.ETIMEOFFICE_PASSWORD    || 'Dimensions@1';
+const INTERVAL = parseInt(process.env.FETCH_INTERVAL_MIN || '5');
+const BASE_URL = 'https://api.etimeoffice.com/api';
 
-let authToken    = '';
-let tokenExpiry  = 0;
-let cookieHeader = '';
+// ── Build Authorization header ────────────────────────────────────────────────
+// FROM API DOC: "value is converted to base64 encoding of (corporateid:username:password:true)"
+function getAuthHeader() {
+  const raw     = `${CORP}:${USER}:${PASS}:true`;
+  const encoded = Buffer.from(raw).toString('base64');
+  return `Basic ${encoded}`;
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
 let syncStatus   = 'idle';
 let lastSyncTime = null;
 let lastError    = null;
 let totalSynced  = 0;
+let lastRecord   = null; // for incremental sync
 let syncLog      = [];
 
-function addLog(msg, type = 'info') {
-  const entry = { time: new Date().toLocaleTimeString('en-IN'), msg, type };
+function log(msg, type = 'info') {
+  const entry = { time: new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'}), msg, type };
   syncLog.unshift(entry);
-  if (syncLog.length > 150) syncLog.pop();
+  if (syncLog.length > 200) syncLog.pop();
   console.log(`[${type.toUpperCase()}] ${msg}`);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// LOGIN — uses exact field names from eTimeOffice login screen
-// CorporateID | UserName | Password
-// ══════════════════════════════════════════════════════════════════════════════
-async function login() {
-  addLog(`Logging in — CorporateID: ${ETO_CORPORATE}, UserName: ${ETO_USERNAME}`, 'info');
+// ════════════════════════════════════════════════════════════════════════════
+// API 1 — DownloadInOutPunchData  (IN/OUT processed)
+// GET https://api.etimeoffice.com/api/DownloadInOutPunchData?Empcode=ALL&FromDate=10/01/2019&ToDate=10/01/2019
+// Returns: { InOutPunchData: [{ Empcode, INTime, OUTTime, WorkTime, Status, DateString, Name, ... }] }
+// ════════════════════════════════════════════════════════════════════════════
+async function fetchInOutData(fromDate, toDate) {
+  // API date format: dd/MM/yyyy
+  const url = `${BASE_URL}/DownloadInOutPunchData?Empcode=ALL&FromDate=${fromDate}&ToDate=${toDate}`;
+  log(`GET ${url}`, 'info');
 
-  // Exact field names matching the eTimeOffice login form
-  const loginPayloads = [
-    // Most likely — matches the form field labels exactly
-    { CorporateId: ETO_CORPORATE, UserName: ETO_USERNAME, Password: ETO_PASSWORD },
-    { CorporateID: ETO_CORPORATE, UserName: ETO_USERNAME, Password: ETO_PASSWORD },
-    { corporateId: ETO_CORPORATE, userName: ETO_USERNAME, password: ETO_PASSWORD },
-    // Alternate formats
-    { CorporateCode: ETO_CORPORATE, UserName: ETO_USERNAME, Password: ETO_PASSWORD },
-    { CompanyId: ETO_CORPORATE,     UserName: ETO_USERNAME, Password: ETO_PASSWORD },
-    { OrgId: ETO_CORPORATE,         UserName: ETO_USERNAME, Password: ETO_PASSWORD },
-    // Flat format
-    { UserName: `${ETO_CORPORATE}\\${ETO_USERNAME}`, Password: ETO_PASSWORD },
-    { UserName: `${ETO_CORPORATE}/${ETO_USERNAME}`,  Password: ETO_PASSWORD },
-  ];
-
-  const loginEndpoints = [
-    `${ETO_BASE}/api/Login`,
-    `${ETO_BASE}/api/UserLogin`,
-    `${ETO_BASE}/api/Account/Login`,
-    `${ETO_BASE}/api/Auth/Login`,
-    `${ETO_BASE}/api/v1/Login`,
-    `${ETO_BASE}/api/CorporateLogin`,
-  ];
-
-  for (const url of loginEndpoints) {
-    for (const payload of loginPayloads) {
-      try {
-        addLog(`POST ${url} → ${JSON.stringify(payload)}`, 'info');
-
-        const res  = await fetch(url, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body:    JSON.stringify(payload),
-        });
-
-        const text = await res.text();
-        addLog(`← ${res.status}: ${text.substring(0, 250)}`, 'info');
-
-        if (res.status === 404) break; // wrong endpoint — try next URL
-
-        // Capture session cookie if present
-        const sc = res.headers.get('set-cookie');
-        if (sc) cookieHeader = sc.split(';')[0];
-
-        let data;
-        try { data = JSON.parse(text); } catch { continue; }
-
-        // Extract token — every possible field name
-        const token =
-          data.Token       || data.token       ||
-          data.AccessToken || data.access_token ||
-          data.AuthToken   || data.auth_token   ||
-          data.SessionId   || data.sessionId    ||
-          data.BearerToken || data.bearer_token ||
-          data.Key         || data.key          || null;
-
-        if (token) {
-          authToken   = token;
-          tokenExpiry = Date.now() + 55 * 60 * 1000;
-          addLog(`✅ Login SUCCESS — token from ${url}`, 'success');
-          return true;
-        }
-
-        // Session-based success (no token in body)
-        const ok =
-          res.status === 200 && (
-            data.Status    === 'Success' || data.status    === 'success' ||
-            data.IsSuccess === true      || data.isSuccess === true      ||
-            data.Result    === true      || data.success   === true      ||
-            (typeof data.Message === 'string' && data.Message.toLowerCase().includes('success'))
-          );
-
-        if (ok) {
-          authToken   = 'SESSION';
-          tokenExpiry = Date.now() + 55 * 60 * 1000;
-          addLog(`✅ Login SUCCESS (session) from ${url}`, 'success');
-          return true;
-        }
-
-        const errMsg = data.Message || data.message || data.Error || data.error || text.substring(0, 100);
-        addLog(`✗ ${url}: ${errMsg}`, 'warn');
-
-      } catch (err) {
-        addLog(`✗ Network error at ${url}: ${err.message}`, 'warn');
-      }
+  const res  = await fetch(url, {
+    headers: {
+      'Authorization': getAuthHeader(),
+      'Accept':        'application/json',
+      'Content-Type':  'application/json',
     }
-  }
+  });
 
-  addLog('❌ All login attempts failed. eTimeOffice may not have API access enabled for this account.', 'error');
-  return false;
+  const text = await res.text();
+  log(`← ${res.status}: ${text.substring(0, 300)}`, 'info');
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.substring(0, 200)}`);
+
+  const data = JSON.parse(text);
+
+  // Response format from doc: { "InOutPunchData": [...], "Error": false, "Msg": "Success" }
+  if (data.Error === true) throw new Error(data.Msg || 'API returned error');
+
+  const records = data.InOutPunchData || data.inOutPunchData || data.Data || data.data || [];
+  log(`✅ Got ${records.length} IN/OUT records`, 'success');
+  return records;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// FETCH ATTENDANCE LOGS
-// ══════════════════════════════════════════════════════════════════════════════
-async function fetchLogs(fromDate, toDate) {
-  if (!authToken || Date.now() > tokenExpiry) {
-    const ok = await login();
-    if (!ok) throw new Error('eTimeOffice login failed — check credentials');
-  }
+// ════════════════════════════════════════════════════════════════════════════
+// API 2 — DownloadLastPunchData  (incremental, raw punches)
+// GET .../DownloadLastPunchData?Empcode=ALL&LastRecord=092020$454
+// Returns: { PunchData:[...], MaxRecord:"092020$456" }
+// ════════════════════════════════════════════════════════════════════════════
+async function fetchLastPunchData() {
+  const param = lastRecord ? `LastRecord=${lastRecord}` : `LastRecord=`;
+  const url   = `${BASE_URL}/DownloadLastPunchData?Empcode=ALL&${param}`;
+  log(`GET ${url}`, 'info');
 
-  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
-  if (authToken && authToken !== 'SESSION') {
-    headers['Authorization'] = `Bearer ${authToken}`;
-    headers['Token']         = authToken;
-    headers['X-Auth-Token']  = authToken;
-  }
-  if (cookieHeader) headers['Cookie'] = cookieHeader;
-
-  const body = {
-    CorporateId: ETO_CORPORATE,
-    CorporateID: ETO_CORPORATE,
-    UserName:    ETO_USERNAME,
-    Password:    ETO_PASSWORD,
-    FromDate:    fromDate,
-    ToDate:      toDate,
-    StartDate:   fromDate,
-    EndDate:     toDate,
-    Date:        fromDate,
-    EmpCode:     '',
-  };
-
-  const endpoints = [
-    `${ETO_BASE}/api/GetAttendanceLogs`,
-    `${ETO_BASE}/api/GetPunchLogs`,
-    `${ETO_BASE}/api/AttendanceLogs`,
-    `${ETO_BASE}/api/GetDailyAttendance`,
-    `${ETO_BASE}/api/GetEmployeePunches`,
-    `${ETO_BASE}/api/Attendance/GetLogs`,
-    `${ETO_BASE}/api/Report/Attendance`,
-    `${ETO_BASE}/api/v1/AttendanceLogs`,
-  ];
-
-  for (const url of endpoints) {
-    try {
-      addLog(`Fetching: POST ${url}`, 'info');
-      const res  = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-      const text = await res.text();
-      addLog(`← ${res.status}: ${text.substring(0, 150)}`, 'info');
-
-      if (res.status === 404 || res.status === 401) continue;
-
-      let data;
-      try { data = JSON.parse(text); } catch { continue; }
-
-      const arr =
-        data.Data   || data.data   || data.Logs    || data.logs    ||
-        data.Records|| data.records|| data.Result  || data.result  ||
-        data.AttendanceLogs || (Array.isArray(data) ? data : null);
-
-      if (Array.isArray(arr)) {
-        addLog(`✅ ${arr.length} punch records from ${url}`, 'success');
-        return arr;
-      }
-    } catch (err) {
-      addLog(`✗ ${url}: ${err.message}`, 'warn');
+  const res  = await fetch(url, {
+    headers: {
+      'Authorization': getAuthHeader(),
+      'Accept':        'application/json',
     }
+  });
+
+  const text = await res.text();
+  log(`← ${res.status}: ${text.substring(0, 300)}`, 'info');
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const data = JSON.parse(text);
+  if (data.Error === true) throw new Error(data.Msg || 'API error');
+
+  // Save MaxRecord for next call
+  if (data.MaxRecord) {
+    lastRecord = data.MaxRecord;
+    log(`MaxRecord updated → ${lastRecord}`, 'info');
+    // Persist to Firebase so it survives restarts
+    await db.collection('biometric_meta').doc('lastRecord').set({ value: lastRecord, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
   }
 
-  throw new Error('No working attendance endpoint. Contact eTimeOffice (080-6901 0000) to enable API access for account: ' + ETO_CORPORATE);
+  return data.PunchData || data.punchData || [];
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// NORMALIZE RAW RECORD
-// ══════════════════════════════════════════════════════════════════════════════
-function normalize(log) {
-  const empCode = String(log.EmpCode || log.empCode || log.UserId || log.EmployeeCode || '').trim();
-  const empName = String(log.EmpName || log.empName || log.Name   || log.EmployeeName || '').trim();
-
-  let date = String(log.PunchDate || log.LogDate || log.AttDate || log.Date || log.date || '').split('T')[0];
-  if (/^\d{2}[-\/]\d{2}[-\/]\d{4}$/.test(date)) {
-    const [d, m, y] = date.split(/[-\/]/);
-    date = `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
-  }
-
-  const time  = String(log.PunchTime || log.Time || log.AttTime || log.time || '').trim();
-  const dirRaw = String(log.Direction || log.PunchType || log.InOut || log.type || '').toLowerCase();
-  const direction = (dirRaw.includes('out') || dirRaw === '1' || dirRaw === 'exit') ? 'OUT' : 'IN';
-
-  return { empCode, empName, date, time, direction };
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SAVE TO FIREBASE
-// ══════════════════════════════════════════════════════════════════════════════
-async function saveToFirebase(records) {
-  const groups = {};
-  for (const r of records) {
-    if (!r.empCode || !r.date) continue;
-    const key = `${r.empCode}_${r.date}`;
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(r);
-  }
-
+// ════════════════════════════════════════════════════════════════════════════
+// Save IN/OUT records to Firebase attendance
+// ════════════════════════════════════════════════════════════════════════════
+async function saveInOutToFirebase(records) {
   let saved = 0;
-  for (const punches of Object.values(groups)) {
-    const sorted   = punches.sort((a, b) => a.time.localeCompare(b.time));
-    const first    = sorted[0];
-    const punchIn  = sorted.find(p => p.direction === 'IN')?.time  || sorted[0].time;
-    const punchOut = [...sorted].reverse().find(p => p.direction === 'OUT')?.time || (sorted.length > 1 ? sorted.at(-1).time : '');
+  for (const r of records) {
+    // Field names from API doc: Empcode, INTime, OUTTime, WorkTime, Status, DateString, Name
+    const empCode  = String(r.Empcode  || r.empcode  || r.EmpCode  || '').trim();
+    const empName  = String(r.Name     || r.name     || r.EmpName  || '').trim();
+    const dateStr  = String(r.DateString || r.Date   || '').trim(); // dd/MM/yyyy
+    const inTime   = String(r.INTime   || r.InTime   || '').trim();
+    const outTime  = String(r.OUTTime  || r.OutTime  || '').trim();
+    const status   = String(r.Status   || '').trim();
+    const workTime = String(r.WorkTime || '').trim();
+    const remark   = String(r.Remark   || '').trim();
+
+    if (!empCode || !dateStr) continue;
+
+    // Convert dd/MM/yyyy → yyyy-MM-dd for Firebase
+    let date = dateStr;
+    if (/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) {
+      const [d, m, y] = dateStr.split('/');
+      date = `${y}-${m}-${d}`;
+    }
 
     try {
       const snap = await db.collection('attendance')
-        .where('empCode', '==', first.empCode)
-        .where('date',    '==', first.date)
+        .where('empCode', '==', empCode)
+        .where('date',    '==', date)
         .get();
 
-      if (snap.empty) {
-        await db.collection('attendance').add({
-          empCode:    first.empCode,
-          empName:    first.empName,
-          date:       first.date,
-          punchIn,
-          punchOut,
-          status:     'Present',
-          source:     'eTimeOffice-LiveSync',
-          punchCount: sorted.length,
-          liveSync:   true,
-          syncedAt:   admin.firestore.FieldValue.serverTimestamp(),
-        });
-      } else {
-        const cur = snap.docs[0].data();
-        const upd = {
-          punchCount: sorted.length,
-          liveSync:   true,
-          syncedAt:   admin.firestore.FieldValue.serverTimestamp(),
-        };
-        if (!cur.punchIn && punchIn)                                    upd.punchIn  = punchIn;
-        if (punchOut && (!cur.punchOut || punchOut > cur.punchOut))     upd.punchOut = punchOut;
-        await snap.docs[0].ref.update(upd);
-      }
+      const docData = {
+        empCode, empName, date,
+        punchIn:   inTime  !== '--:--' ? inTime  : '',
+        punchOut:  outTime !== '--:--' ? outTime : '',
+        status:    status || 'Present',
+        workTime,  remark,
+        source:    'eTimeOffice-API',
+        liveSync:  true,
+        syncedAt:  admin.firestore.FieldValue.serverTimestamp(),
+      };
 
-      // Also save raw punch log
-      for (const p of sorted) {
-        await db.collection('biometric_logs').add({
-          ...p, source: 'eTimeOffice-LiveSync',
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      if (snap.empty) {
+        await db.collection('attendance').add(docData);
+      } else {
+        await snap.docs[0].ref.update(docData);
       }
       saved++;
     } catch (e) {
-      addLog(`Firebase error for ${first.empCode}: ${e.message}`, 'error');
+      log(`Firebase error ${empCode}/${date}: ${e.message}`, 'error');
     }
   }
   return saved;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// MAIN SYNC
-// ══════════════════════════════════════════════════════════════════════════════
-async function runSync(fromDate, toDate) {
-  if (syncStatus === 'syncing') { addLog('Already syncing, skipping...', 'warn'); return { skipped: true }; }
+// ════════════════════════════════════════════════════════════════════════════
+// Save raw punch data to Firebase
+// ════════════════════════════════════════════════════════════════════════════
+async function saveRawPunchesToFirebase(punches) {
+  let saved = 0;
+  for (const p of punches) {
+    const empCode  = String(p.Empcode  || p.EmpCode  || '').trim();
+    const empName  = String(p.Name     || p.EmpName  || '').trim();
+    const punchDT  = String(p.PunchDate || '').trim(); // "30/09/2020 09:46:00"
+    const id       = p.ID || p.id;
 
-  const today = new Date().toISOString().split('T')[0];
+    if (!empCode || !punchDT) continue;
+
+    // Parse "dd/MM/yyyy HH:mm:ss"
+    let date = '', time = '';
+    const parts = punchDT.split(' ');
+    if (parts.length >= 2) {
+      const [d, m, y] = parts[0].split('/');
+      date = `${y}-${m}-${d}`;
+      time = parts[1].substring(0, 5); // HH:mm
+    }
+
+    try {
+      // Upsert attendance record
+      const snap = await db.collection('attendance')
+        .where('empCode', '==', empCode)
+        .where('date',    '==', date)
+        .get();
+
+      if (snap.empty) {
+        await db.collection('attendance').add({
+          empCode, empName, date,
+          punchIn:  time,
+          punchOut: '',
+          status:   'Present',
+          source:   'eTimeOffice-API',
+          liveSync: true,
+          syncedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        const cur = snap.docs[0].data();
+        const upd = { liveSync: true, syncedAt: admin.firestore.FieldValue.serverTimestamp() };
+        if (!cur.punchIn)  upd.punchIn  = time;
+        if (time > (cur.punchIn || '00:00')) upd.punchOut = time;
+        await snap.docs[0].ref.update(upd);
+      }
+
+      // Save raw punch log
+      await db.collection('biometric_logs').add({
+        empCode, empName, date, time, punchDateTime: punchDT,
+        etoId: id, source: 'eTimeOffice-API',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      saved++;
+    } catch (e) {
+      log(`Firebase error ${empCode}: ${e.message}`, 'error');
+    }
+  }
+  return saved;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MAIN SYNC — uses InOut API (primary) + LastPunch API (incremental)
+// ════════════════════════════════════════════════════════════════════════════
+async function runSync(fromDate, toDate) {
+  if (syncStatus === 'syncing') { log('Already syncing, skip', 'warn'); return { skipped: true }; }
+
+  // Default: today in dd/MM/yyyy format
+  const now     = new Date(new Date().toLocaleString('en-US', {timeZone:'Asia/Kolkata'}));
+  const dd      = String(now.getDate()).padStart(2, '0');
+  const mm      = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy    = now.getFullYear();
+  const today   = `${dd}/${mm}/${yyyy}`;
+
   fromDate = fromDate || today;
   toDate   = toDate   || today;
 
   syncStatus = 'syncing';
-  addLog(`━━━ SYNC START ${fromDate} → ${toDate} ━━━`, 'info');
+  log(`━━━ SYNC START ${fromDate} → ${toDate} ━━━`, 'info');
+
+  let totalSaved = 0;
 
   try {
-    const raw     = await fetchLogs(fromDate, toDate);
-    const records = raw.map(normalize).filter(r => r.empCode && r.date);
-    addLog(`Normalized ${records.length} records`, 'info');
+    // 1) Fetch IN/OUT processed data (best for attendance)
+    try {
+      const inOutRecords = await fetchInOutData(fromDate, toDate);
+      const saved = await saveInOutToFirebase(inOutRecords);
+      totalSaved += saved;
+      log(`InOut saved: ${saved}`, 'success');
+    } catch (e) {
+      log(`InOut API failed: ${e.message} — trying raw punch API`, 'warn');
 
-    const saved  = await saveToFirebase(records);
-    totalSynced += saved;
+      // 2) Fallback: fetch incremental raw punches
+      const punches = await fetchLastPunchData();
+      const saved   = await saveRawPunchesToFirebase(punches);
+      totalSaved += saved;
+      log(`Raw punches saved: ${saved}`, 'success');
+    }
+
+    totalSynced += totalSaved;
     lastSyncTime = new Date().toISOString();
     lastError    = null;
     syncStatus   = 'idle';
-    addLog(`━━━ SYNC DONE — ${saved} saved to Firebase ━━━`, 'success');
-    return { synced: saved, total: totalSynced };
+    log(`━━━ SYNC DONE — ${totalSaved} records saved ━━━`, 'success');
+    return { synced: totalSaved, total: totalSynced };
+
   } catch (err) {
     lastError  = err.message;
     syncStatus = 'error';
-    addLog(`━━━ SYNC FAILED: ${err.message} ━━━`, 'error');
+    log(`━━━ SYNC FAILED: ${err.message} ━━━`, 'error');
     throw err;
   }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SCHEDULER — runs automatically every N minutes
-// ══════════════════════════════════════════════════════════════════════════════
-function startScheduler() {
-  addLog(`⏰ Auto-sync every ${INTERVAL_MIN} minutes`, 'info');
-  setTimeout(async () => { try { await runSync(); } catch {} }, 10000);
-  setInterval(async () => { try { await runSync(); } catch {} }, INTERVAL_MIN * 60 * 1000);
+// ── Scheduler ─────────────────────────────────────────────────────────────────
+async function loadLastRecord() {
+  try {
+    const doc = await db.collection('biometric_meta').doc('lastRecord').get();
+    if (doc.exists) {
+      lastRecord = doc.data().value;
+      log(`Restored LastRecord: ${lastRecord}`, 'info');
+    }
+  } catch {}
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// HTTP ROUTES
-// ══════════════════════════════════════════════════════════════════════════════
+function startScheduler() {
+  log(`⏰ Auto-sync every ${INTERVAL} minutes`, 'info');
+  loadLastRecord().then(() => {
+    setTimeout(async () => { try { await runSync(); } catch {} }, 5000);
+    setInterval(async () => { try { await runSync(); } catch {} }, INTERVAL * 60 * 1000);
+  });
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
-  app: 'DIMS HRMS — eTimeOffice Live Sync Server',
-  status: syncStatus, lastSyncTime, lastError, totalSynced,
-  interval: `Every ${INTERVAL_MIN} min`,
+  app:         'DIMS HRMS — eTimeOffice Live Sync',
+  status:       syncStatus,
+  lastSyncTime, lastError, totalSynced,
+  lastRecord,
+  interval:    `Every ${INTERVAL} min`,
+  auth:        `Basic ${Buffer.from(`${CORP}:${USER}:${PASS}:true`).toString('base64')}`,
   credentials: {
-    corporateId: ETO_CORPORATE  ? `✅ ${ETO_CORPORATE}` : '❌ Missing',
-    userName:    ETO_USERNAME   ? `✅ ${ETO_USERNAME}`  : '❌ Missing',
-    password:    ETO_PASSWORD   ? '✅ Set'              : '❌ Missing',
+    corporateId: CORP ? `✅ ${CORP}` : '❌ Missing',
+    userName:    USER ? `✅ ${USER}` : '❌ Missing',
+    password:    PASS ? '✅ Set'     : '❌ Missing',
     firebase:    serviceAccount.project_id ? `✅ ${serviceAccount.project_id}` : '❌ Missing',
   },
-  recentLogs: syncLog.slice(0, 20),
+  apiDocs: {
+    inOut:     `${BASE_URL}/DownloadInOutPunchData?Empcode=ALL&FromDate=DD/MM/YYYY&ToDate=DD/MM/YYYY`,
+    lastPunch: `${BASE_URL}/DownloadLastPunchData?Empcode=ALL&LastRecord=MMYYYY$ID`,
+    rawPunch:  `${BASE_URL}/DownloadPunchData?Empcode=ALL&FromDate=DD/MM/YYYY_HH:mm&ToDate=DD/MM/YYYY_HH:mm`,
+  },
+  recentLogs: syncLog.slice(0, 25),
 }));
 
-app.get('/status',     (req, res) => res.json({ syncStatus, lastSyncTime, lastError, totalSynced, logs: syncLog.slice(0, 30) }));
-app.get('/test/login', async (req, res) => {
-  authToken = ''; tokenExpiry = 0; cookieHeader = '';
-  const ok = await login();
-  res.json({ success: ok, corporateId: ETO_CORPORATE, userName: ETO_USERNAME, logs: syncLog.slice(0, 30) });
-});
+app.get('/status',    (req, res) => res.json({ syncStatus, lastSyncTime, lastError, totalSynced, lastRecord, logs: syncLog.slice(0, 30) }));
 app.get('/sync/now',  async (req, res) => {
-  try   { res.json({ success: true,  ...(await runSync()), logs: syncLog.slice(0, 20) }); }
+  const { from, to } = req.query;
+  try   { res.json({ success: true,  ...(await runSync(from, to)), logs: syncLog.slice(0, 20) }); }
   catch (e) { res.status(500).json({ success: false, error: e.message, logs: syncLog.slice(0, 20) }); }
 });
 app.post('/sync/now', async (req, res) => {
@@ -362,11 +330,26 @@ app.post('/sync/now', async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// Test auth header
+app.get('/test/auth', (req, res) => {
+  const raw     = `${CORP}:${USER}:${PASS}:true`;
+  const encoded = Buffer.from(raw).toString('base64');
+  res.json({ raw, encoded, header: `Basic ${encoded}` });
+});
+
+// Manual date range sync
+app.get('/sync/date', async (req, res) => {
+  const { from, to } = req.query;
+  if (!from) return res.status(400).json({ error: 'Provide ?from=DD/MM/YYYY&to=DD/MM/YYYY' });
+  try   { res.json({ success: true, ...(await runSync(from, to || from)) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  addLog(`🚀 Server running on port ${PORT}`, 'info');
-  addLog(`CorporateID: ${ETO_CORPORATE} | UserName: ${ETO_USERNAME}`, 'info');
-  if (ETO_USERNAME && ETO_PASSWORD) startScheduler();
-  else addLog('⚠️ Set ETIMEOFFICE_CORPORATEID, ETIMEOFFICE_USERNAME, ETIMEOFFICE_PASSWORD in Render!', 'error');
+  log(`🚀 Server on port ${PORT}`, 'info');
+  log(`Auth: Basic ${Buffer.from(`${CORP}:${USER}:${PASS}:true`).toString('base64')}`, 'info');
+  log(`API Doc says: Header Authorization = Basic base64(corporateid:username:password:true)`, 'info');
+  startScheduler();
 });
