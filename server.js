@@ -353,3 +353,90 @@ app.listen(PORT, () => {
   log(`API Doc says: Header Authorization = Basic base64(corporateid:username:password:true)`, 'info');
   startScheduler();
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// IMPORT EMPLOYEES — extract unique employees from eTimeOffice attendance
+// and save them to Firebase employees collection
+// GET /import/employees
+// ════════════════════════════════════════════════════════════════════════════
+app.get('/import/employees', async (req, res) => {
+  log('━━━ EMPLOYEE IMPORT START ━━━', 'info');
+  try {
+    // Fetch last 30 days to get all active employees
+    const now   = new Date(new Date().toLocaleString('en-US', {timeZone:'Asia/Kolkata'}));
+    const toD   = `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+    const past  = new Date(now); past.setDate(past.getDate() - 30);
+    const fromD = `${String(past.getDate()).padStart(2,'0')}/${String(past.getMonth()+1).padStart(2,'0')}/${past.getFullYear()}`;
+
+    log(`Fetching attendance ${fromD} → ${toD} to extract employees`, 'info');
+    const records = await fetchInOutData(fromD, toD);
+
+    // Extract unique employees from attendance records
+    const empMap = {};
+    for (const r of records) {
+      const code = String(r.Empcode || r.empcode || r.EmpCode || '').trim();
+      const name = String(r.Name    || r.name    || r.EmpName || '').trim();
+      if (!code || empMap[code]) continue;
+      empMap[code] = { code, name };
+    }
+
+    const uniqueEmps = Object.values(empMap);
+    log(`Found ${uniqueEmps.length} unique employees`, 'info');
+
+    // Check existing employees in Firebase to avoid duplicates
+    const existingSnap = await db.collection('employees').get();
+    const existingCodes = new Set(existingSnap.docs.map(d => d.data().employeeCode || ''));
+
+    let imported = 0, skipped = 0;
+    const importedList = [];
+
+    for (const emp of uniqueEmps) {
+      if (existingCodes.has(emp.code)) { skipped++; continue; }
+
+      const empData = {
+        employeeCode:     emp.code,
+        name:             emp.name || `Employee ${emp.code}`,
+        designation:      '',
+        department:       '',
+        status:           'Active',
+        joiningDate:      '',
+        salary:           0,
+        phone:            '',
+        email:            '',
+        address:          '',
+        bankAccount:      '',
+        ifsc:             '',
+        bankName:         '',
+        pan:              '',
+        aadhar:           '',
+        gender:           'Male',
+        dob:              '',
+        pfNumber:         '',
+        esiNumber:        '',
+        emergencyContact: '',
+        source:           'eTimeOffice-AutoImport',
+        createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      const docRef = await db.collection('employees').add(empData);
+      importedList.push({ id: docRef.id, code: emp.code, name: emp.name });
+      imported++;
+    }
+
+    log(`━━━ EMPLOYEE IMPORT DONE — ${imported} imported, ${skipped} already existed ━━━`, 'success');
+
+    res.json({
+      success:  true,
+      imported,
+      skipped,
+      total:    uniqueEmps.length,
+      employees: importedList,
+      message:  `✅ ${imported} employees imported into Firebase! ${skipped} already existed.`,
+      nextStep: 'Refresh your DIMS HRMS app — all employees will appear in the Employees tab!',
+    });
+
+  } catch (err) {
+    log(`Employee import failed: ${err.message}`, 'error');
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
