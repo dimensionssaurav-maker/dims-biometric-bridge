@@ -28,6 +28,21 @@ function getAuthHeader() {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let syncStatus   = 'idle';
+let empCodeToFirebaseId = {}; // cache: empCode → Firebase employee doc ID
+
+async function loadEmployeeCache() {
+  try {
+    const snap = await db.collection('employees').get();
+    empCodeToFirebaseId = {};
+    snap.docs.forEach(d => {
+      const code = d.data().employeeCode || '';
+      if (code) empCodeToFirebaseId[code] = d.id;
+    });
+    log(`Employee cache loaded: ${Object.keys(empCodeToFirebaseId).length} employees`, 'info');
+  } catch(e) {
+    log(`Employee cache load failed: ${e.message}`, 'warn');
+  }
+}
 let lastSyncTime = null;
 let lastError    = null;
 let totalSynced  = 0;
@@ -245,10 +260,11 @@ async function runSync(fromDate, toDate) {
 
   let totalSaved = 0;
 
+  let inOutRecords = [];
   try {
     // 1) Fetch IN/OUT processed data (best for attendance)
     try {
-      const inOutRecords = await fetchInOutData(fromDate, toDate);
+      inOutRecords = await fetchInOutData(fromDate, toDate);
       const saved = await saveInOutToFirebase(inOutRecords);
       totalSaved += saved;
       log(`InOut saved: ${saved}`, 'success');
@@ -260,6 +276,40 @@ async function runSync(fromDate, toDate) {
       const saved   = await saveRawPunchesToFirebase(punches);
       totalSaved += saved;
       log(`Raw punches saved: ${saved}`, 'success');
+    }
+
+    // ── Auto-register new employees found in attendance ─────────────────
+    try {
+      const empSnap = await db.collection('employees').get();
+      const knownCodes = new Set(empSnap.docs.map(d => d.data().employeeCode || ''));
+      const newEmpsFromAtt = {};
+
+      for (const r of (typeof inOutRecords !== 'undefined' ? inOutRecords : [])) {
+        const code = String(r.Empcode || r.EmpCode || '').trim();
+        const name = String(r.Name || r.EmpName || '').trim();
+        if (code && !knownCodes.has(code) && !newEmpsFromAtt[code]) {
+          newEmpsFromAtt[code] = { code, name };
+        }
+      }
+
+      let newEmpCount = 0;
+      for (const emp of Object.values(newEmpsFromAtt)) {
+        const docRef = await db.collection('employees').add({
+          employeeCode: emp.code,
+          name:         emp.name || `Employee ${emp.code}`,
+          designation:  '', department: '', category: '',
+          status:       'Active', joiningDate: '', salary: 0,
+          phone: '', email: '', gender: 'Male',
+          source: 'eTimeOffice-AutoSync',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        empCodeToFirebaseId[emp.code] = docRef.id;
+        newEmpCount++;
+        log(`New employee auto-added: ${emp.code} - ${emp.name}`, 'success');
+      }
+      if (newEmpCount > 0) log(`${newEmpCount} new employees auto-registered!`, 'success');
+    } catch(e) {
+      log(`Auto-register check failed: ${e.message}`, 'warn');
     }
 
     totalSynced += totalSaved;
@@ -290,7 +340,7 @@ async function loadLastRecord() {
 
 function startScheduler() {
   log(`⏰ Auto-sync every ${INTERVAL} minutes`, 'info');
-  loadLastRecord().then(() => {
+  Promise.all([loadLastRecord(), loadEmployeeCache()]).then(() => {
     setTimeout(async () => { try { await runSync(); } catch {} }, 5000);
     setInterval(async () => { try { await runSync(); } catch {} }, INTERVAL * 60 * 1000);
   });
@@ -356,20 +406,23 @@ async function fetchEmployeeMaster() {
     'Content-Type':  'application/json',
   };
 
-  // All possible employee master endpoints
+  // All possible employee master endpoints (based on eTimeOffice Employee Master page)
   const endpoints = [
     `${BASE_URL}/GetEmployeeMaster`,
+    `${BASE_URL}/DownloadEmployeeMaster`,
     `${BASE_URL}/GetAllEmployee`,
-    `${BASE_URL}/EmployeeMaster`,
     `${BASE_URL}/GetEmployeeList`,
+    `${BASE_URL}/EmployeeMaster`,
     `${BASE_URL}/GetEmployee`,
     `${BASE_URL}/EmployeeList`,
     `${BASE_URL}/GetEmployeeDetails`,
     `${BASE_URL}/GetEmployeeInfo`,
-    `${BASE_URL}/DownloadEmployeeMaster`,
     `${BASE_URL}/GetMasterEmployee`,
     `${BASE_URL}/Employee/GetAll`,
     `${BASE_URL}/v1/GetEmployeeMaster`,
+    `${BASE_URL}/GetEmpMaster`,
+    `${BASE_URL}/DownloadEmpMaster`,
+    `${BASE_URL}/GetEmpDetails`,
   ];
 
   for (const url of endpoints) {
@@ -446,15 +499,19 @@ app.get('/import/employees', async (req, res) => {
         if (!empMap[code]) empMap[code] = { code, name: '' };
 
         // Extract all possible fields from master
+        // Field names from eTimeOffice Employee Master screen:
+        // EmpCode, EnrolledId, Name, Dept.Name, Desg.Name, Cat.Name
         empMap[code].name        = empMap[code].name || m.Name || m.EmpName || m.EmployeeName || '';
-        empMap[code].department  = m.Department || m.Dept || m.DeptName || m.department || '';
-        empMap[code].designation = m.Designation || m.Desg || m.DesignationName || m.designation || '';
+        empMap[code].department  = m.DeptName  || m.Dept_Name || m.Department || m.Dept || m.department || '';
+        empMap[code].designation = m.DesgName  || m.Desg_Name || m.Designation || m.Desg || m.designation || '';
+        empMap[code].category    = m.CatName   || m.Cat_Name  || m.Category || m.cat || '';
+        empMap[code].enrolledId  = m.EnrolledId || m.EnrolledID || m.CardNo || m.EmpcardNo || '';
         empMap[code].doj         = m.DOJ || m.DateOfJoining || m.JoiningDate || m.doj || m.joiningDate || '';
         empMap[code].dob         = m.DOB || m.DateOfBirth   || m.dob || '';
         empMap[code].gender      = m.Gender || m.gender || 'Male';
         empMap[code].phone       = m.Mobile || m.Phone || m.ContactNo || m.phone || '';
         empMap[code].email       = m.Email  || m.email || '';
-        empMap[code].cardNo      = m.CardNo || m.EmpcardNo || m.cardNo || '';
+        empMap[code].cardNo      = m.EnrolledId || m.CardNo || m.EmpcardNo || m.cardNo || '';
       }
     }
 
@@ -523,6 +580,8 @@ app.get('/import/employees', async (req, res) => {
         name:        emp.name,
         department:  emp.department  || '—',
         designation: emp.designation || '—',
+        category:    emp.category    || '—',
+        enrolledId:  emp.enrolledId  || '—',
         joiningDate: joiningDate     || '—',
       });
       imported++;
